@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
@@ -30,3 +31,253 @@ model Post {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+=======
+// StockSense data model.
+//
+// CORE DESIGN RULE: stock-on-hand is never stored. There is no `quantity`
+// column on Product (or anywhere else) that gets incremented/decremented.
+// Every change in stock is recorded as a StockMove row: "N units of product P
+// went from location A to location B". Stock at a location is DERIVED by
+// summing DONE moves into it minus DONE moves out of it (see lib/stock.ts).
+//
+// Why?
+//  - Single source of truth: a stored counter can drift from reality (crashed
+//    request, race between two updates, manual DB edit). A ledger can't,
+//    because the number IS the history.
+//  - Audit trail for free: "why is stock 12?" = list the moves.
+//  - Time travel: stock at any past date = sum of moves up to that date.
+//  - One table for all four operations; they differ only in locations used.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum Role {
+  MANAGER
+  STAFF
+}
+
+// INTERNAL locations are physical places in a warehouse where stock sits.
+// The others are VIRTUAL: they give every move a "from" and a "to" even when
+// goods enter or leave the company, so quantity is never created or destroyed.
+//   RECEIPT    : VENDOR   -> INTERNAL
+//   DELIVERY   : INTERNAL -> CUSTOMER
+//   INTERNAL   : INTERNAL -> INTERNAL
+//   ADJUSTMENT : INTERNAL <-> INVENTORY_LOSS  (damage, shrinkage, recounts)
+enum LocationType {
+  INTERNAL
+  VENDOR
+  CUSTOMER
+  INVENTORY_LOSS
+}
+
+enum DocumentType {
+  RECEIPT
+  DELIVERY
+  INTERNAL
+  ADJUSTMENT
+}
+
+// Only DONE moves affect stock. DRAFT -> WAITING -> READY describe planned or
+// in-progress work; CANCELED moves are kept for the audit trail.
+enum MoveStatus {
+  DRAFT
+  WAITING
+  READY
+  DONE
+  CANCELED
+}
+
+// ─── Models ─────────────────────────────────────────────────────────────────
+
+model User {
+  id           String @id @default(cuid())
+  name         String
+  email        String @unique
+  passwordHash String
+  role         Role   @default(STAFF)
+
+  // Password-reset OTP. `otp` holds a bcrypt HASH of the 6-digit code, never
+  // the code itself, so a DB leak doesn't expose live reset codes.
+  // `otpAttempts` caps wrong guesses: a 6-digit code is brute-forceable
+  // within its 10-minute window without it.
+  otp         String?
+  otpExpiry   DateTime?
+  otpAttempts Int       @default(0)
+
+  // Bumped whenever the password changes. The session JWT carries the value
+  // it was issued with; getCurrentUser() rejects tokens whose version no
+  // longer matches, so a password change/reset logs out every other session.
+  sessionVersion Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Audit: who raised / who validated each stock document.
+  documentsCreated   StockDocument[] @relation("DocumentCreatedBy")
+  documentsValidated StockDocument[] @relation("DocumentValidatedBy")
+}
+
+model Category {
+  id          String @id @default(cuid())
+  name        String @unique
+  description String @default("")
+
+  // Back-relation: not a column. Lets you query category.products.
+  products Product[]
+}
+
+model Product {
+  id            String   @id @default(cuid())
+  name          String
+  sku           String   @unique
+  unitOfMeasure String   @default("pcs")
+  // Low-stock threshold: alert when derived stock <= reorderLevel.
+  reorderLevel  Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // FK column + relation field. `onDelete: Restrict` stops a category being
+  // deleted while products still reference it.
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  // NOTE: deliberately no `quantity` column. See header comment.
+  stockMoves StockMove[]
+
+  @@index([categoryId])
+}
+
+model Warehouse {
+  id   String @id @default(cuid())
+  name String
+  // Short code used as a document prefix, e.g. "WH" -> "WH/IN/0001".
+  code String @unique
+
+  locations Location[]
+}
+
+model Location {
+  id   String       @id @default(cuid())
+  name String
+  type LocationType
+
+  // Nullable because VIRTUAL locations (vendor/customer/loss) don't belong to
+  // a physical warehouse. INTERNAL locations always set it.
+  warehouseId String?
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  // StockMove references Location twice, so each side needs a relation name
+  // to tell Prisma which FK the back-relation belongs to.
+  outgoingMoves StockMove[] @relation("MoveSource")
+  incomingMoves StockMove[] @relation("MoveDest")
+
+  documentsFrom StockDocument[] @relation("DocumentSource")
+  documentsTo   StockDocument[] @relation("DocumentDest")
+
+  @@index([warehouseId])
+  @@index([type])
+}
+
+// A stock DOCUMENT is the business paperwork (a transfer order, an adjustment,
+// later receipts and deliveries); its StockMoves are the ledger lines.
+//
+//   StockDocument  WH/INT/0003  DRAFT   WH/Stock -> Shelf A
+//     ├─ StockMove  Mouse  x10  DRAFT
+//     └─ StockMove  Pens   x 5  DRAFT
+//
+// The document gives users one thing to create, review, validate or cancel,
+// and moves all its lines through their statuses together (see
+// lib/stock/documents.ts). Stock is still computed ONLY from moves.
+model StockDocument {
+  id        String       @id @default(cuid())
+  // Human-readable, unique, sequential per prefix: "WH/INT/0001".
+  reference String       @unique
+  type      DocumentType
+  status    MoveStatus   @default(DRAFT)
+  // Reason / free-text note (required for adjustments).
+  note      String       @default("")
+
+  // Default source/destination for the lines. Nullable so future document
+  // types can mix locations per line.
+  sourceLocationId String?
+  sourceLocation   Location? @relation("DocumentSource", fields: [sourceLocationId], references: [id], onDelete: Restrict)
+  destLocationId   String?
+  destLocation     Location? @relation("DocumentDest", fields: [destLocationId], references: [id], onDelete: Restrict)
+
+  // ADJUSTMENT only: the snapshot the correction was computed from, kept for
+  // the audit trail ("system said 12, we counted 9, so we booked -3").
+  recordedQuantity Int?
+  countedQuantity  Int?
+
+  createdById   String?
+  createdBy     User?     @relation("DocumentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  validatedById String?
+  validatedBy   User?     @relation("DocumentValidatedBy", fields: [validatedById], references: [id], onDelete: SetNull)
+  validatedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  moves StockMove[]
+
+  @@index([type, status])
+  @@index([createdAt])
+}
+
+// Atomic counters for document references. One row per prefix ("WH/INT/"),
+// incremented with an upsert so concurrent creators never get the same number.
+model DocumentSequence {
+  prefix String @id
+  value  Int    @default(0)
+}
+
+// The ledger. This single table powers receipts, deliveries, internal
+// transfers and adjustments.
+model StockMove {
+  id           String       @id @default(cuid())
+  // Always positive; direction comes from source -> dest, never from the sign.
+  // (A DB CHECK constraint enforcing > 0 is added in the migration SQL.)
+  quantity     Int
+  documentType DocumentType
+  status       MoveStatus   @default(DRAFT)
+  // Human-readable document number, e.g. "WH/IN/0001". Several moves (lines)
+  // can share one reference.
+  reference    String       @default("")
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  // When the move became DONE, i.e. when stock actually changed. The ledger
+  // dates moves by this (falling back to createdAt for moves not yet done).
+  doneAt       DateTime?
+
+  // The document this move is a line of. Nullable for moves created outside
+  // a document (none today, but it keeps the ledger open to system moves).
+  documentId String?
+  document   StockDocument? @relation(fields: [documentId], references: [id], onDelete: Restrict)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  sourceLocationId String
+  sourceLocation   Location @relation("MoveSource", fields: [sourceLocationId], references: [id], onDelete: Restrict)
+
+  destLocationId String
+  destLocation   Location @relation("MoveDest", fields: [destLocationId], references: [id], onDelete: Restrict)
+
+  // getStockOnHand filters by product + status, then by dest (incoming) or
+  // source (outgoing); these composite indexes serve both halves.
+  @@index([productId, status, destLocationId])
+  @@index([productId, status, sourceLocationId])
+  @@index([status])
+  @@index([reference])
+  @@index([documentId])
+  @@index([createdAt])
+  @@index([documentType, status])
+}
+>>>>>>> 0591416c68fbcee960e3d70906ac4f197bafc26b
