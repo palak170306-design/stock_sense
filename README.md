@@ -5,6 +5,9 @@ internal transfers, stock adjustments, a complete stock ledger, and a KPI
 dashboard with low-stock alerts. Two roles: **managers** change things,
 **staff** see everything.
 
+https://stock-sense-aaace1.vercel.app/
+
+
 **Stack:** Next.js 16 (App Router, TypeScript) · PostgreSQL · Prisma 7 · Tailwind CSS 4 · Vitest
 
 ---
